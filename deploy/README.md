@@ -4,7 +4,7 @@ This document demonstrates the deployment of the [OmniDrive](https://arxiv.org/a
 ## Table of Contents
 
 1. [Deployment strategy](#strategy)
-2. [Deployment Guideline](#guide)
+2. [Deployment Guide](#guide)
 3. [Results analysis](#result)
     - [Accuracy performance](#acc)
     - [Inference latencies](#latency)
@@ -31,8 +31,8 @@ For TensorRT-LLM, we use TensorRT 10.4, and TensorRT-LLM 0.13 to deploy the Omni
 
 Please refer to this [config](../projects/configs/OmniDrive/eva_base_tinyllama.py) for model details. 
 
-## Deployment Guideline <a name="guide"></a>
-Please refer to the [TensorRT-LLM deployment guideline](./docs/trtllm_guide.md) and [TensorRT-Edge-LLM deployment guideline](./docs/edgellm_guide.md) for the detailed instructions on how to set up environment, build engines, and run engine inference with TensorRT-LLM and TensorRT-Edge-LLM.
+## Deployment Guide <a name="guide"></a>
+Please refer to the [TensorRT-LLM deployment guide](./docs/trtllm_guide.md) and [TensorRT-Edge-LLM deployment guide](./docs/edgellm_guide.md) for the detailed instructions on how to set up environment, build engines, and run engine inference with TensorRT-LLM and TensorRT-Edge-LLM.
 
 ## Results analysis <a name="result"></a>
 ### Accuracy performance <a name="acc"></a>
@@ -76,3 +76,4 @@ Overall Latency (ms)                 | 794.25  | 392.55
 3. [TinyLlama paper](https://arxiv.org/abs/2401.02385)
 4. [TensorRT repo](https://github.com/NVIDIA/TensorRT)
 5. [TensorRT-LLM repo](https://github.com/NVIDIA/TensorRT-LLM)
+6. [TensorRT-Edge-LLM](https://github.com/NVIDIA/TensorRT-Edge-LLM)
