@@ -12,6 +12,7 @@
 import tempfile
 import numpy as np
 import json
+import csv
 from mmdet.datasets import DATASETS
 from mmdet3d.datasets import NuScenesDataset
 from mmdet.datasets import DATASETS
@@ -44,6 +45,10 @@ class CustomNuScenesDataset(NuScenesDataset):
                  lane_path='./data/nuscenes/data_dict_sample.pkl',
                  lane_anno_file='./data/nuscenes/data_dict_subset_B_val.pkl',
                  eval_mode=['lane', 'det'],
+                doscenes_csv=None,
+                enable_doscenes_instruction=False,
+                random_doscenes_instruction=False,
+                only_doscenes_samples=False,
                  *args, 
                  **kwargs):
         super().__init__(*args, **kwargs)
@@ -53,12 +58,74 @@ class CustomNuScenesDataset(NuScenesDataset):
         self.lane_info = pickle.load(open(lane_path, 'rb'))
         self.vqa_data = dict()
         self.lane_anno_file = lane_anno_file
+
+        self.enable_doscenes_instruction = enable_doscenes_instruction
+        self.random_doscenes_instruction = random_doscenes_instruction
+        if self.enable_doscenes_instruction:
+            self.doscenes_map, self.doscenes_multi_map = self._load_doscenes_map(doscenes_csv)
+        else:
+            self.doscenes_map, self.doscenes_multi_map = {}, {}
+        self.only_doscenes_samples = only_doscenes_samples
+        if self.only_doscenes_samples and self.doscenes_map:
+            self._filter_data_infos_by_doscenes()
         
             
         if seq_mode:
             self.seq_split_num = seq_split_num
             self.random_length = 0
             self._set_sequence_group_flag() # Must be called after load_annotations b/c load_annotations does sorting.
+    def _load_doscenes_map(self, doscenes_csv):
+        """Load scene-level doScenes instructions from a CSV file if provided."""
+        if not doscenes_csv:
+            return {}, {}
+
+        csv_path = doscenes_csv
+        if not osp.isabs(csv_path):
+            csv_path = osp.join(os.getcwd(), csv_path)
+
+        if not osp.exists(csv_path):
+            print(f"[CustomNuScenesDataset] doScenes CSV not found: {csv_path}")
+            return {}, {}
+
+        doscenes_map = {}
+        doscenes_multi_map = {}
+        with open(csv_path, newline='', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                scene_number = row.get('Scene Number')
+                instruction = (row.get('Instruction') or '').strip()
+                if not scene_number or not instruction:
+                    continue
+                try:
+                    scene_name = f"scene-{int(float(scene_number)):04d}"
+                except ValueError:
+                    continue
+                if scene_name not in doscenes_multi_map:
+                    doscenes_multi_map[scene_name] = []
+                doscenes_multi_map[scene_name].append(instruction)
+                # Keep the first instruction as deterministic fallback.
+                if scene_name not in doscenes_map:
+                    doscenes_map[scene_name] = instruction
+
+        num_total = sum(len(v) for v in doscenes_multi_map.values())
+        print(
+            "[CustomNuScenesDataset] Loaded doScenes instructions from "
+            f"{csv_path}: scenes={len(doscenes_map)}, total_instructions={num_total}"
+        )
+        return doscenes_map, doscenes_multi_map
+
+    def _filter_data_infos_by_doscenes(self):
+        """Keep only samples whose scene has a doScenes instruction."""
+        before = len(self.data_infos)
+        self.data_infos = [
+            info for info in self.data_infos
+            if info.get('scene_name', '') in self.doscenes_map
+        ]
+        after = len(self.data_infos)
+        print(
+            "[CustomNuScenesDataset] Filtered samples by doScenes instructions: "
+            f"{before} -> {after}"
+        )
 
     
     def _set_sequence_group_flag(self):
@@ -128,6 +195,16 @@ class CustomNuScenesDataset(NuScenesDataset):
         ego_pose = e2g_matrix
 
         ego_pose_inv = invert_matrix_egopose_numpy(ego_pose)
+
+        scene_name = info.get('scene_name', '')
+        doscenes_instruction = ''
+        if self.enable_doscenes_instruction:
+            doscenes_instruction = self.doscenes_map.get(scene_name, '')
+            if self.random_doscenes_instruction and not self.test_mode:
+                candidates = self.doscenes_multi_map.get(scene_name, [])
+                if candidates:
+                    doscenes_instruction = random.choice(candidates)
+
         
             
         input_dict = dict(
@@ -145,6 +222,8 @@ class CustomNuScenesDataset(NuScenesDataset):
             frame_idx=info['frame_idx'],
             timestamp=info['timestamp'] / 1e6,
             cam_infos=info['cams'],
+            doscenes_instruction=doscenes_instruction,
+            scene_name=scene_name,
         )
 
         if self.modality['use_camera']:

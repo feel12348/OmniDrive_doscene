@@ -1,3 +1,5 @@
+import os
+
 _base_ = [
     '../../../mmdetection3d/configs/_base_/datasets/nus-3d.py',
     '../../../mmdetection3d/configs/_base_/default_runtime.py'
@@ -18,7 +20,7 @@ class_names = [
     'motorcycle', 'bicycle', 'pedestrian', 'traffic_cone'
 ]
 
-num_gpus = 8
+num_gpus = int(os.environ.get('NUM_GPUS', 4))
 batch_size = 2
 num_iters_per_epoch = 28130 // (num_gpus * batch_size)
 num_epochs = 6
@@ -161,6 +163,11 @@ model = dict(
 
 dataset_type = 'CustomNuScenesDataset'
 data_root = './data/nuscenes/'
+doscenes_csv = '/home/fzj/data_2/challenge/doScenes-VLM-Planning/data/doScenes/annotated_doscenes.csv'
+# Master switch: whether to inject doScenes instruction into prompts.
+# Keep False by default for decoupled baseline training.
+enable_doscenes_instruction = False
+random_doscenes_instruction = True
 
 file_client_args = dict(backend='disk')
 
@@ -234,6 +241,9 @@ data = dict(
         type=dataset_type,
         data_root=data_root,
         ann_file=data_root + 'nuscenes2d_ego_temporal_infos_train.pkl',
+        doscenes_csv=doscenes_csv,
+        enable_doscenes_instruction=enable_doscenes_instruction,
+        random_doscenes_instruction=(enable_doscenes_instruction and random_doscenes_instruction),
         seq_split_num=1, # streaming video training
         seq_mode=True, # streaming video training
         pipeline=train_pipeline,

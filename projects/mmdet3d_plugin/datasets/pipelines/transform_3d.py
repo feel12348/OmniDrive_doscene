@@ -687,12 +687,18 @@ class LoadAnnoatationVQA():
 
         sources = self.preprocess_vqa(results, traj)
         prompt = f"You are driving in {results['location']}. "
+        planning_prompt = prompt
+        doscenes_instruction = results.get('doscenes_instruction', '').strip()
 
         online_sources = self.online_vqa(results)
         sources += online_sources
 
         random.shuffle(sources)
         if 'gt_planning' in results.keys() and len(planning_traj) == 6:
+            if doscenes_instruction:
+                planning_prompt += (
+                    f'The passenger says: "{doscenes_instruction}". '
+                )
             sources = [
                 [{"from": 'human',
                 "value": "Please provide the planning trajectory for the ego car without reasons."},
@@ -701,7 +707,9 @@ class LoadAnnoatationVQA():
                 ] + sources          
                  
         vqa_anno = [item for pair in sources for item in pair]
-        vqa_anno[0]['value'] = DEFAULT_IMAGE_TOKEN + '\n' + prompt + vqa_anno[0]['value']  
+        first_prompt = planning_prompt if ('gt_planning' in results.keys() and len(planning_traj) == 6) else prompt
+        vqa_anno[0]['value'] = DEFAULT_IMAGE_TOKEN + '\n' + first_prompt + vqa_anno[0]['value']  
+        # print(vqa_anno[0]['value'])
         vqa_converted = preprocess([vqa_anno], self.tokenizer, True)
         input_ids = vqa_converted['input_ids'][0]
         vlm_labels = vqa_converted['labels'][0]
@@ -710,6 +718,8 @@ class LoadAnnoatationVQA():
         results['vlm_labels'] = vlm_labels
         
         return results
+
+
 
     def __repr__(self):
         repr_str = self.__class__.__name__
@@ -829,16 +839,27 @@ class LoadAnnoatationVQATest():
     def __call__(self, results):
         sources = self.preprocess_vqa(results)
         prompt = f"You are driving in {results['location']}. "
+        doscenes_instruction = results.get('doscenes_instruction', '').strip()
+        if doscenes_instruction:
+            prompt += (
+                f'The passenger says: "{doscenes_instruction}". '
+            )
 
+        questions = [anno[0]['value'] for anno in sources]
         vlm_labels = [anno[0]['value'] for anno in sources]
  
         for anno in sources:
-            anno[0]['value'] = DEFAULT_IMAGE_TOKEN + '\n' + prompt + anno[0]['value']  
+            # if anno[0]['value']=='Please provide the planning trajectory for the ego car without reasons.':
+            #     anno[1]['value'] = 'Here is the planning trajectory'
+            # else:
+            #     anno[1]['value'] = ''
+            anno[0]['value'] = DEFAULT_IMAGE_TOKEN + '\n' + prompt + anno[0]['value']
             anno[1]['value'] = ''
         vqa_converted = preprocess(sources, self.tokenizer, True, False)
         input_ids = vqa_converted['input_ids']
         results['input_ids'] = input_ids
         results['vlm_labels'] = vlm_labels
+        results['questions'] = questions
         
         return results
 

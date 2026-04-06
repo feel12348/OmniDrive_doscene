@@ -6,6 +6,9 @@ onnxs_data/
 test/
 engines/
 hide/
+log_train/
+log_test/
+mmdetection3d/
 results_planning_only*/
 deploy/llm_lib/llm_checkpoint*/
 deploy/llm_lib/llm_engine*/
