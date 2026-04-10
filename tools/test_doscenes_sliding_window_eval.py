@@ -321,15 +321,15 @@ def parse_pt_traj_from_text(text):
 
 def parse_prediction_from_file(path):
     if not osp.exists(path):
-        return None, 'prediction_file_missing'
+        return None, 'prediction_file_missing', None
     try:
         with open(path, 'r', encoding='utf-8') as f:
             pred_data = json.load(f)
     except Exception:
-        return None, 'prediction_file_invalid_json'
+        return None, 'prediction_file_invalid_json', None
 
     if not isinstance(pred_data, list) or not pred_data:
-        return None, 'prediction_empty'
+        return None, 'prediction_empty', pred_data
 
     answer_text = None
     for item in pred_data:
@@ -343,12 +343,12 @@ def parse_prediction_from_file(path):
                 break
 
     if not isinstance(answer_text, str):
-        return None, 'prediction_missing_answer'
+        return None, 'prediction_missing_answer', pred_data
 
     traj = parse_pt_traj_from_text(answer_text)
     if traj is None:
-        return None, 'prediction_parse_failed'
-    return traj, None
+        return None, 'prediction_parse_failed', pred_data
+    return traj, None, pred_data
 
 
 def parse_prediction_from_model_output(outputs):
@@ -403,6 +403,22 @@ def summarize_metric_records(records):
     ade3 = float(np.mean([r['ade3s'] for r in valid]))
     made = (ade1 + ade2 + ade3) / 3.0
     return dict(count=len(valid), ade1s=ade1, ade2s=ade2, ade3s=ade3, made=made)
+
+
+def summarize_error_records(records):
+    total_records = len(records)
+    error_records = [r for r in records if not r.get('valid_for_metric', False)]
+    error_count = len(error_records)
+    error_stats = defaultdict(int)
+    for record in error_records:
+        error_stats[record.get('prediction_error', 'unknown')] += 1
+    error_rate = (float(error_count) / float(total_records)) if total_records > 0 else 0.0
+    return dict(
+        total_records=total_records,
+        error_count=error_count,
+        error_rate=error_rate,
+        error_stats=dict(error_stats),
+    )
 
 
 def finalize_ade_for_records(records):
@@ -582,8 +598,7 @@ def main():
                 if args.single_window_output_json:
                     pred_traj, err, text_out = parse_prediction_from_model_output(_)
                 else:
-                    pred_traj, err = parse_prediction_from_file(output_path)
-                    text_out = None
+                    pred_traj, err, text_out = parse_prediction_from_file(output_path)
 
                 gt_traj = info['gt_planning'][0, :, :2]
                 gt_mask = info['gt_planning_mask'][0]
@@ -706,6 +721,7 @@ def main():
         global_errors[k] = global_errors.get(k, 0) + v
 
     global_summary = summarize_metric_records(all_records)
+    global_error_summary = summarize_error_records(all_records)
 
     per_scene_summary = {}
     for scene_name in sorted({r['scene_name'] for r in all_records}):
@@ -714,6 +730,7 @@ def main():
 
     instruction_type_summary = {}
     instruction_type_error_stats = {}
+    instruction_type_error_summary = {}
     instruction_types = sorted({r.get('instruction_type', 'unknown') for r in all_records})
     for inst_type in instruction_types:
         type_records = [r for r in all_records if r.get('instruction_type', 'unknown') == inst_type]
@@ -727,6 +744,7 @@ def main():
                 k = r.get('prediction_error', 'unknown')
                 type_errors[k] += 1
         instruction_type_error_stats[inst_type] = dict(type_errors)
+        instruction_type_error_summary[inst_type] = summarize_error_records(type_records)
 
     print('[SlidingEval] ===== Final Metrics =====')
     print(f"[SlidingEval] valid_windows={global_summary['count']} / total_records={len(all_records)}")
@@ -734,12 +752,19 @@ def main():
     print(f"[SlidingEval] ADE2s={global_summary['ade2s']}")
     print(f"[SlidingEval] ADE3s={global_summary['ade3s']}")
     print(f"[SlidingEval] MADE={(global_summary['made'])}")
+    print(
+        f"[SlidingEval] error_windows={global_error_summary['error_count']} / "
+        f"total_records={global_error_summary['total_records']} "
+        f"(error_rate={global_error_summary['error_rate']:.4f})"
+    )
 
     print('[SlidingEval] instruction_type_metrics:')
     for inst_type in instruction_types:
         s = instruction_type_summary[inst_type]
+        es = instruction_type_error_summary[inst_type]
         print(
             f"  - {inst_type}: valid={s['count']} / total={s['total_records']}, "
+            f"errors={es['error_count']} (error_rate={es['error_rate']:.4f}), "
             f"ADE1s={s['ade1s']}, ADE2s={s['ade2s']}, ADE3s={s['ade3s']}, MADE={s['made']}"
         )
 
@@ -761,9 +786,11 @@ def main():
         future_frames=future_frames,
         window_stride=args.window_stride,
         global_metrics=global_summary,
+        global_error_summary=global_error_summary,
         scene_metrics=per_scene_summary,
         instruction_type_metrics=instruction_type_summary,
         instruction_type_error_stats=instruction_type_error_stats,
+        instruction_type_error_summary=instruction_type_error_summary,
         total_records=len(all_records),
         error_stats=dict(global_errors),
         per_instruction_json_dir=args.per_instruction_json_dir,
@@ -782,7 +809,6 @@ def main():
         print(f'[SlidingEval] single window output saved to {args.single_window_output_json}')
 
     if dist.is_initialized():
-        dist.barrier()
         dist.destroy_process_group()
 
 

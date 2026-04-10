@@ -1,12 +1,15 @@
 import argparse
 import csv
 import importlib
+import json
 import os
 import os.path as osp
+import re
 import sys
 from collections import defaultdict
 
 import mmcv
+import numpy as np
 import torch
 import torch.distributed as dist
 from mmcv import Config
@@ -39,6 +42,14 @@ def parse_args():
         '--index-json',
         default=None,
         help='optional json path to dump output metadata index')
+    parser.add_argument(
+        '--per-instruction-json-dir',
+        default=None,
+        help='optional directory to dump one json per instruction')
+    parser.add_argument(
+        '--metrics-json',
+        default=None,
+        help='optional path to dump final metrics json')
     parser.add_argument(
         '--max-scenes',
         type=int,
@@ -102,6 +113,7 @@ def load_instruction_map(csv_path):
         reader = csv.DictReader(f)
         for row in reader:
             scene_number = row.get('Scene Number')
+            instruction_type = (row.get('Instruction Type') or 'unknown').strip() or 'unknown'
             instruction = (row.get('Instruction') or '').strip()
             if not scene_number or not instruction:
                 continue
@@ -109,7 +121,12 @@ def load_instruction_map(csv_path):
                 scene_name = f"scene-{int(float(scene_number)):04d}"
             except ValueError:
                 continue
-            scene_to_insts[scene_name].append(instruction)
+            scene_to_insts[scene_name].append(
+                dict(
+                    instruction=instruction,
+                    instruction_type=instruction_type,
+                )
+            )
     return scene_to_insts
 
 
@@ -249,7 +266,153 @@ def run_single_sample(model, dataset, index, instruction, output_name=None, skip
     batch = collate([sample], samples_per_gpu=1)
     inject_runtime_meta(batch, skip_save=skip_save, output_name=output_name)
     with torch.no_grad():
-        _ = model(return_loss=False, rescale=True, **batch)
+        outputs = model(return_loss=False, rescale=True, **batch)
+    return outputs
+
+
+def parse_pt_traj_from_text(text):
+    full_match = re.search(r'\[PT, \((\+?[\d\.-]+, \+?[\d\.-]+)\)(, \(\+?[\d\.-]+, \+?[\d\.-]+\))*\]', text)
+    if not full_match:
+        return None
+    coordinates_matches = re.findall(r'\(\+?[\d\.-]+, \+?[\d\.-]+\)', full_match.group(0))
+    points = []
+    for coord in coordinates_matches:
+        nums = re.findall(r'-?\d+\.\d+|-?\d+', coord)
+        if len(nums) < 2:
+            return None
+        points.append((float(nums[0]), float(nums[1])))
+    return points if points else None
+
+
+def parse_prediction_from_model_output(outputs):
+    if outputs is None:
+        return None, 'prediction_empty', None
+    if not isinstance(outputs, list) or len(outputs) == 0:
+        return None, 'prediction_invalid_output_type', None
+    sample_out = outputs[0]
+    if not isinstance(sample_out, dict):
+        return None, 'prediction_invalid_output_payload', None
+    text_out = sample_out.get('text_out', None)
+    if not isinstance(text_out, list) or len(text_out) == 0:
+        return None, 'prediction_missing_answer', text_out
+
+    answer_text = None
+    for item in text_out:
+        if isinstance(item, dict):
+            a = item.get('A')
+            if isinstance(a, list) and len(a) > 0:
+                answer_text = a[0]
+                break
+            if isinstance(a, str):
+                answer_text = a
+                break
+    if not isinstance(answer_text, str):
+        return None, 'prediction_missing_answer', text_out
+    traj = parse_pt_traj_from_text(answer_text)
+    if traj is None:
+        return None, 'prediction_parse_failed', text_out
+    return traj, None, text_out
+
+
+def parse_prediction_from_file(path):
+    if not osp.exists(path):
+        return None, 'prediction_file_missing', None
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            pred_data = json.load(f)
+    except Exception:
+        return None, 'prediction_file_invalid_json', None
+
+    if not isinstance(pred_data, list) or not pred_data:
+        return None, 'prediction_empty', pred_data
+
+    answer_text = None
+    for item in pred_data:
+        if isinstance(item, dict):
+            a = item.get('A')
+            if isinstance(a, list) and len(a) > 0:
+                answer_text = a[0]
+                break
+            if isinstance(a, str):
+                answer_text = a
+                break
+    if not isinstance(answer_text, str):
+        return None, 'prediction_missing_answer', pred_data
+    traj = parse_pt_traj_from_text(answer_text)
+    if traj is None:
+        return None, 'prediction_parse_failed', pred_data
+    return traj, None, pred_data
+
+
+def summarize_error_records(records):
+    total_records = len(records)
+    error_records = [r for r in records if not r.get('valid_for_metric', False)]
+    error_count = len(error_records)
+    error_stats = defaultdict(int)
+    for record in error_records:
+        error_stats[record.get('prediction_error', 'unknown')] += 1
+    error_rate = (float(error_count) / float(total_records)) if total_records > 0 else 0.0
+    return dict(
+        total_records=total_records,
+        error_count=error_count,
+        error_rate=error_rate,
+        error_stats=dict(error_stats),
+    )
+
+
+def compute_ades(pred_xy, gt_xy):
+    if pred_xy.shape[0] < 6 or gt_xy.shape[0] < 6:
+        return None
+
+    d = np.sqrt(np.sum((pred_xy[:6, :2] - gt_xy[:6, :2]) ** 2, axis=-1))
+    ade1 = float(np.mean(d[:2]))
+    ade2 = float(np.mean(d[:4]))
+    ade3 = float(np.mean(d[:6]))
+    made = (ade1 + ade2 + ade3) / 3.0
+    return ade1, ade2, ade3, made
+
+
+def summarize_metric_records(records):
+    valid = [r for r in records if r.get('valid_for_metric', False)]
+    if not valid:
+        return dict(count=0, ade1s=None, ade2s=None, ade3s=None, made=None)
+
+    ade1 = float(np.mean([r['ade1s'] for r in valid]))
+    ade2 = float(np.mean([r['ade2s'] for r in valid]))
+    ade3 = float(np.mean([r['ade3s'] for r in valid]))
+    made = (ade1 + ade2 + ade3) / 3.0
+    return dict(count=len(valid), ade1s=ade1, ade2s=ade2, ade3s=ade3, made=made)
+
+
+def finalize_ade_for_records(records):
+    extra_errors = defaultdict(int)
+    for record in records:
+        if not record.get('valid_for_metric', False):
+            continue
+        if all(k in record for k in ['ade1s', 'ade2s', 'ade3s', 'made']):
+            continue
+        pred = np.array(record.get('pred_traj_xy', []), dtype=np.float32)
+        gt = np.array(record.get('gt_traj_xy', []), dtype=np.float32)
+        ades = compute_ades(pred, gt)
+        if ades is None:
+            record['valid_for_metric'] = False
+            record['prediction_error'] = 'prediction_too_short'
+            extra_errors['prediction_too_short'] += 1
+            continue
+        ade1, ade2, ade3, made = ades
+        record['ade1s'] = ade1
+        record['ade2s'] = ade2
+        record['ade3s'] = ade3
+        record['made'] = made
+    return extra_errors
+
+
+def sanitize_instruction_text(text, max_len=48):
+    s = re.sub(r'[^0-9a-zA-Z_-]+', '_', (text or '').strip())
+    s = re.sub(r'_+', '_', s).strip('_')
+    if not s:
+        s = 'empty'
+    return s[:max_len]
 
 
 def build_scene_indices(dataset):
@@ -280,6 +443,11 @@ def main():
     else:
         save_dir = args.save_dir
     mmcv.mkdir_or_exist(save_dir)
+    per_instruction_json_dir = args.per_instruction_json_dir
+    if per_instruction_json_dir is None and args.index_json:
+        per_instruction_json_dir = args.index_json + '.instruction_jsons'
+    if per_instruction_json_dir is not None:
+        mmcv.mkdir_or_exist(per_instruction_json_dir)
 
     scene_to_insts = load_instruction_map(args.doscenes_csv)
     scene_to_indices = build_scene_indices(dataset)
@@ -314,13 +482,22 @@ def main():
                 f'{scene_name}: frames={len(frame_indices)}, instructions={len(instructions)}'
             )
 
-        for inst_id, instruction_text in enumerate(instructions):
+        for inst_id, instruction_item in enumerate(instructions):
+            instruction_text = (
+                instruction_item.get('instruction', '')
+                if isinstance(instruction_item, dict) else str(instruction_item)
+            )
+            instruction_type = (
+                instruction_item.get('instruction_type', 'unknown')
+                if isinstance(instruction_item, dict) else 'unknown'
+            )
             process_this_instruction = (instruction_task_id % world_size == rank)
             instruction_task_id += 1
             if not process_this_instruction:
                 continue
 
             reset_temporal_memory(model)
+            inst_records = []
 
             # Warm-up phase: advance temporal memory without instruction.
             warm_end = min(history_frames, len(frame_indices))
@@ -333,7 +510,7 @@ def main():
                     f'{sample_token}__{scene_name}__inst{inst_id:03d}'
                     f'__warmup__frame{frame_idx:04d}.json'
                 )
-                run_single_sample(
+                _ = run_single_sample(
                     model=model,
                     dataset=dataset,
                     index=warm_idx,
@@ -357,7 +534,7 @@ def main():
                     f'{sample_token}__{scene_name}__inst{inst_id:03d}'
                     f'__seq__frame{frame_idx:04d}.json'
                 )
-                run_single_sample(
+                outputs = run_single_sample(
                     model=model,
                     dataset=dataset,
                     index=idx,
@@ -365,22 +542,73 @@ def main():
                     output_name=output_name,
                     skip_save=False,
                 )
+                output_path = osp.join(save_dir, output_name)
+                pred_traj, pred_err, text_out = parse_prediction_from_file(output_path)
+                if pred_err == 'prediction_file_missing':
+                    pred_traj, pred_err, text_out = parse_prediction_from_model_output(outputs)
 
-                metadata_index.append(
-                    dict(
-                        output_name=output_name,
-                        sample_token=sample_token,
-                        scene_name=scene_name,
-                        frame_idx=frame_idx,
-                        instruction_id=inst_id,
-                        instruction=instruction_text,
-                        applied_instruction=(instruction != ''),
-                        phase='sequential',
-                    )
+                gt_traj = info['gt_planning'][0, :, :2]
+                gt_mask = info['gt_planning_mask'][0]
+                fut_valid_flag = bool(gt_mask.all())
+
+                record = dict(
+                    output_name=output_name,
+                    sample_token=sample_token,
+                    scene_name=scene_name,
+                    frame_idx=frame_idx,
+                    instruction_id=inst_id,
+                    instruction_type=instruction_type,
+                    instruction=instruction_text,
+                    applied_instruction=(instruction != ''),
+                    phase='sequential',
+                    prediction_error=pred_err,
+                    valid_output=(pred_err is None),
+                    valid_for_metric=False,
+                    text_out=text_out,
+                    gt_traj_xy=gt_traj[:, :2].tolist(),
+                    gt_mask=gt_mask.tolist(),
                 )
+                if pred_traj is not None:
+                    record['pred_traj_xy'] = pred_traj.tolist()
+
+                if not fut_valid_flag:
+                    record['prediction_error'] = record['prediction_error'] or 'gt_mask_invalid'
+                elif pred_traj is None:
+                    pass
+                elif pred_traj.shape[0] < 6:
+                    record['prediction_error'] = 'prediction_too_short'
+                else:
+                    record['valid_for_metric'] = True
+
+                metadata_index.append(record)
+                inst_records.append(metadata_index[-1])
                 local_total_outputs += 1
                 if local_total_outputs % 100 == 0:
                     print(f'[FullSceneEval][rank{rank}] completed outputs: {local_total_outputs}')
+
+            if per_instruction_json_dir is not None and inst_records:
+                safe_type = sanitize_instruction_text(instruction_type, max_len=16)
+                safe_hint = sanitize_instruction_text(instruction_text)
+                inst_path = osp.join(
+                    per_instruction_json_dir,
+                    f'{scene_name}__inst{inst_id:03d}__type-{safe_type}__{safe_hint}.json',
+                )
+                inst_payload = dict(
+                    scene_name=scene_name,
+                    instruction_id=inst_id,
+                    instruction=instruction_text,
+                    instruction_type=instruction_type,
+                    num_records=len(inst_records),
+                    records=inst_records,
+                    metric_summary=summarize_metric_records(inst_records),
+                    error_summary=summarize_error_records(inst_records),
+                )
+                mmcv.dump(inst_payload, inst_path)
+                print(
+                    f'[FullSceneEval][rank{rank}] saved instruction json: {inst_path} '
+                    f'(records={len(inst_records)})',
+                    flush=True,
+                )
 
     if world_size > 1 and dist.is_initialized():
         dist.barrier()
@@ -388,10 +616,94 @@ def main():
     total_outputs = gather_int(local_total_outputs, rank, world_size)
 
     if is_main_process(rank):
+        extra_errors = finalize_ade_for_records(all_records)
+        global_error_summary = summarize_error_records(all_records)
+        global_summary = summarize_metric_records(all_records)
+        global_errors = dict(global_error_summary['error_stats'])
+        for k, v in extra_errors.items():
+            global_errors[k] = global_errors.get(k, 0) + v
+        global_error_summary['error_stats'] = global_errors
+        global_error_summary['error_count'] = int(sum(global_errors.values()))
+        if global_error_summary['total_records'] > 0:
+            global_error_summary['error_rate'] = (
+                float(global_error_summary['error_count']) /
+                float(global_error_summary['total_records'])
+            )
+        instruction_type_error_summary = {}
+        instruction_type_metrics = {}
+        instruction_types = sorted({r.get('instruction_type', 'unknown') for r in all_records})
+        for inst_type in instruction_types:
+            type_records = [r for r in all_records if r.get('instruction_type', 'unknown') == inst_type]
+            instruction_type_error_summary[inst_type] = summarize_error_records(type_records)
+            type_summary = summarize_metric_records(type_records)
+            type_summary['total_records'] = len(type_records)
+            instruction_type_metrics[inst_type] = type_summary
+
+        per_scene_metrics = {}
+        for scene_name in sorted({r['scene_name'] for r in all_records}):
+            scene_records = [r for r in all_records if r['scene_name'] == scene_name]
+            per_scene_metrics[scene_name] = summarize_metric_records(scene_records)
+
         print(f'[FullSceneEval] done. total outputs={total_outputs}, save_dir={save_dir}')
+        print('[FullSceneEval] ===== Final Metrics =====')
+        print(f"[FullSceneEval] valid_records={global_summary['count']} / total_records={len(all_records)}")
+        print(f"[FullSceneEval] ADE1s={global_summary['ade1s']}")
+        print(f"[FullSceneEval] ADE2s={global_summary['ade2s']}")
+        print(f"[FullSceneEval] ADE3s={global_summary['ade3s']}")
+        print(f"[FullSceneEval] MADE={global_summary['made']}")
+        print(
+            f"[FullSceneEval] error_outputs={global_error_summary['error_count']} / "
+            f"total_records={global_error_summary['total_records']} "
+            f"(error_rate={global_error_summary['error_rate']:.4f})"
+        )
+        if global_error_summary['error_stats']:
+            print('[FullSceneEval] error_stats:')
+            for k in sorted(global_error_summary['error_stats'].keys()):
+                print(f"  - {k}: {global_error_summary['error_stats'][k]}")
+        print('[FullSceneEval] instruction_type_metrics:')
+        for inst_type in instruction_types:
+            m = instruction_type_metrics[inst_type]
+            s = instruction_type_error_summary[inst_type]
+            print(
+                f"  - {inst_type}: valid={m['count']} / total={m['total_records']}, "
+                f"errors={s['error_count']} (error_rate={s['error_rate']:.4f}), "
+                f"ADE1s={m['ade1s']}, ADE2s={m['ade2s']}, ADE3s={m['ade3s']}, MADE={m['made']}"
+            )
+        if args.metrics_json:
+            metrics_payload = dict(
+                config=args.config,
+                checkpoint=args.checkpoint,
+                doscenes_csv=args.doscenes_csv,
+                save_dir=save_dir,
+                total_outputs=total_outputs,
+                global_metrics=global_summary,
+                global_error_summary=global_error_summary,
+                scene_metrics=per_scene_metrics,
+                instruction_type_metrics=instruction_type_metrics,
+                instruction_type_error_summary=instruction_type_error_summary,
+                per_instruction_json_dir=per_instruction_json_dir,
+            )
+            mmcv.dump(metrics_payload, args.metrics_json)
+            print(f'[FullSceneEval] metrics saved to {args.metrics_json}')
         if args.index_json:
             mmcv.dump(all_records, args.index_json)
             print(f'[FullSceneEval] index saved to {args.index_json}')
+            summary_path = args.index_json + '.summary.json'
+            summary_payload = dict(
+                config=args.config,
+                checkpoint=args.checkpoint,
+                doscenes_csv=args.doscenes_csv,
+                save_dir=save_dir,
+                total_outputs=total_outputs,
+                global_metrics=global_summary,
+                global_error_summary=global_error_summary,
+                scene_metrics=per_scene_metrics,
+                instruction_type_metrics=instruction_type_metrics,
+                instruction_type_error_summary=instruction_type_error_summary,
+                per_instruction_json_dir=per_instruction_json_dir,
+            )
+            mmcv.dump(summary_payload, summary_path)
+            print(f'[FullSceneEval] summary saved to {summary_path}')
 
 
 if __name__ == '__main__':

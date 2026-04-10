@@ -847,6 +847,7 @@ class LoadAnnoatationVQATest():
 
         questions = [anno[0]['value'] for anno in sources]
         vlm_labels = [anno[0]['value'] for anno in sources]
+        model_input_prompts = []
  
         for anno in sources:
             # if anno[0]['value']=='Please provide the planning trajectory for the ego car without reasons.':
@@ -854,12 +855,15 @@ class LoadAnnoatationVQATest():
             # else:
             #     anno[1]['value'] = ''
             anno[0]['value'] = DEFAULT_IMAGE_TOKEN + '\n' + prompt + anno[0]['value']
+            model_input_prompts.append(anno[0]['value'])
             anno[1]['value'] = ''
         vqa_converted = preprocess(sources, self.tokenizer, True, False)
         input_ids = vqa_converted['input_ids']
         results['input_ids'] = input_ids
         results['vlm_labels'] = vlm_labels
         results['questions'] = questions
+        results['model_input_prompts'] = model_input_prompts
+        results['model_conversation_prompts'] = vqa_converted.get('prompts', model_input_prompts)
         
         return results
 

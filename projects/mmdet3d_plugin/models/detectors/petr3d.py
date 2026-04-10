@@ -431,8 +431,24 @@ class Petr3D(MVXTwoStageDetector):
             lane_results = self.map_head.get_bboxes(outs, img_metas)
 
         generated_text = []
-        if self.with_lm_head and not os.path.exists(self.save_path+img_metas[0]['sample_idx']) :
-            mmcv.mkdir_or_exist(self.save_path)
+        save_name = img_metas[0].get('output_name', img_metas[0]['sample_idx'])
+        skip_save = bool(img_metas[0].get('skip_save', False))
+        injected_instruction = img_metas[0].get('doscenes_instruction', '')
+        scene_name = img_metas[0].get('scene_name', '')
+        model_input_prompts = img_metas[0].get('model_input_prompts', [])
+        model_conversation_prompts = img_metas[0].get('model_conversation_prompts', [])
+        force_rewrite_preds = os.environ.get('FORCE_REWRITE_PREDS', '0') == '1'
+        if os.path.isabs(save_name):
+            save_file = save_name
+        else:
+            save_file = os.path.join(self.save_path, save_name)
+
+        should_generate = self.with_lm_head and (
+            skip_save or force_rewrite_preds or not os.path.exists(save_file)
+        )
+        if should_generate:
+            if not skip_save:
+                mmcv.mkdir_or_exist(os.path.dirname(save_file) or self.save_path)
             vision_embeded = torch.cat([vision_embeded_obj, vision_embeded_map], dim=1)
             for i, input_ids in enumerate(data['input_ids'][0]):
                 input_ids = input_ids.unsqueeze(0)
@@ -448,11 +464,17 @@ class Petr3D(MVXTwoStageDetector):
                 )
                 generated_text.append(
                     dict(
-                    Q=img_metas[0]['vlm_labels'].data[i],
-                    A=self.tokenizer.batch_decode(output_ids, skip_special_tokens=True),
+                        Q=img_metas[0]['vlm_labels'].data[i],
+                        A=self.tokenizer.batch_decode(output_ids, skip_special_tokens=True),
+                        doscenes_instruction=injected_instruction,
+                        model_input_prompt=model_input_prompts[i] if i < len(model_input_prompts) else None,
+                        model_conversation_prompt=model_conversation_prompts[i] if i < len(model_conversation_prompts) else None,
+                        scene_name=scene_name,
+                        applied_instruction=bool(injected_instruction),
                     ))
-            with open(self.save_path+img_metas[0]['sample_idx'], 'w') as file:
-                json.dump(generated_text, file)
+            if not skip_save:
+                with open(save_file, 'w') as file:
+                    json.dump(generated_text, file)
         return bbox_results, generated_text, lane_results
     
     def simple_test(self, img_metas, **data):

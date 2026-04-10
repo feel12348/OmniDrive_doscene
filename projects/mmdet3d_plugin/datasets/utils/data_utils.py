@@ -196,6 +196,7 @@ def preprocess_v1(
             input_ids = [tokenizer_image_token(prompt, tokenizer, return_tensors='pt') for prompt in conversations]
             return dict(
                 input_ids=input_ids,
+                prompts=conversations,
             )
     else:
         input_ids = tokenizer(
@@ -342,7 +343,7 @@ def preprocess_plain(
         tokenized_len = len(tokenizer_image_token(source[0]['value'], tokenizer))
         target[:tokenized_len] = IGNORE_INDEX
 
-    return dict(input_ids=input_ids, labels=targets)
+    return dict(input_ids=input_ids, labels=targets, prompts=conversations)
 
 def preprocess(
     sources,
