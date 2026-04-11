@@ -6,8 +6,8 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 EXP_NAME="${EXP_NAME:-exp03}"
 CONDA_ENV="${CONDA_ENV:-omnidrive}"
-GPU_SET_A="${GPU_SET_A:-4,5}"
-GPU_SET_B="${GPU_SET_B:-6,7}"
+GPU_SET_A="${GPU_SET_A:-0,1,2,3}"
+GPU_SET_B="${GPU_SET_B:-4,5,6,7}"
 PORT_A="${PORT_A:-29501}"
 PORT_B="${PORT_B:-29502}"
 LOG_DIR="${LOG_DIR:-${REPO_ROOT}/log_test/runner_logs/${EXP_NAME}}"
@@ -18,11 +18,6 @@ preflight_check() {
 
   if [[ ! -f "${REPO_ROOT}/scripts/doscene_test_window.sh" ]]; then
     echo "Missing script: scripts/doscene_test_window.sh"
-    bad=1
-  fi
-
-  if [[ ! -f "${REPO_ROOT}/scripts/doscene_test_full_scene.sh" ]]; then
-    echo "Missing script: scripts/doscene_test_full_scene.sh"
     bad=1
   fi
 
@@ -54,8 +49,8 @@ run_pair() {
   local pair_name="$1"
   local cmd_a="$2"
   local cmd_b="$3"
-  local log_a="${LOG_DIR}/${pair_name}_gpu01.log"
-  local log_b="${LOG_DIR}/${pair_name}_gpu23.log"
+  local log_a="${LOG_DIR}/${pair_name}_lang.log"
+  local log_b="${LOG_DIR}/${pair_name}_nolang.log"
 
   echo "============================================================"
   echo "Starting pair: ${pair_name}"
@@ -103,13 +98,10 @@ run_pair() {
 
 CMD_WINDOW_LANG="CUDA_VISIBLE_DEVICES=${GPU_SET_A} MASTER_PORT=${PORT_A} NO_INSTRUCTION=0 EXP_NAME=${EXP_NAME} CONDA_ENV=${CONDA_ENV} bash scripts/doscene_test_window.sh"
 CMD_WINDOW_NOLANG="CUDA_VISIBLE_DEVICES=${GPU_SET_B} MASTER_PORT=${PORT_B} NO_INSTRUCTION=1 EXP_NAME=${EXP_NAME} CONDA_ENV=${CONDA_ENV} bash scripts/doscene_test_window.sh"
-CMD_FULL_LANG="CUDA_VISIBLE_DEVICES=${GPU_SET_A} MASTER_PORT=${PORT_A} NO_INSTRUCTION=0 EXP_NAME=${EXP_NAME} CONDA_ENV=${CONDA_ENV} bash scripts/doscene_test_full_scene.sh"
-CMD_FULL_NOLANG="CUDA_VISIBLE_DEVICES=${GPU_SET_B} MASTER_PORT=${PORT_B} NO_INSTRUCTION=1 EXP_NAME=${EXP_NAME} CONDA_ENV=${CONDA_ENV} bash scripts/doscene_test_full_scene.sh"
 
 preflight_check
-run_pair "pair1_window_first" "${CMD_WINDOW_LANG}" "${CMD_WINDOW_NOLANG}"
-run_pair "pair2_full_scene_second" "${CMD_FULL_LANG}" "${CMD_FULL_NOLANG}"
+run_pair "window_pair" "${CMD_WINDOW_LANG}" "${CMD_WINDOW_NOLANG}"
 
 echo "============================================================"
-echo "All 4 runs completed successfully."
+echo "Window runs completed successfully."
 echo "EXP_NAME=${EXP_NAME}"

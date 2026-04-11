@@ -281,7 +281,9 @@ def parse_pt_traj_from_text(text):
         if len(nums) < 2:
             return None
         points.append((float(nums[0]), float(nums[1])))
-    return points if points else None
+    if not points:
+        return None
+    return np.array(points, dtype=np.float32)
 
 
 def parse_prediction_from_model_output(outputs):
@@ -578,7 +580,16 @@ def main():
                 elif pred_traj.shape[0] < 6:
                     record['prediction_error'] = 'prediction_too_short'
                 else:
-                    record['valid_for_metric'] = True
+                    ades = compute_ades(pred_traj, gt_traj)
+                    if ades is None:
+                        record['prediction_error'] = 'prediction_too_short'
+                    else:
+                        ade1, ade2, ade3, made = ades
+                        record['valid_for_metric'] = True
+                        record['ade1s'] = ade1
+                        record['ade2s'] = ade2
+                        record['ade3s'] = ade3
+                        record['made'] = made
 
                 metadata_index.append(record)
                 inst_records.append(metadata_index[-1])
