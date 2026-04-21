@@ -12,8 +12,11 @@ from mmdet.core import bbox_xyxy_to_cxcywh
 from mmdet.models.utils.transformer import inverse_sigmoid
 from peft import LoraConfig, get_peft_model
 from ..dense_heads.llava_llama import LlavaLlamaForCausalLM
+from ..dense_heads.asr_llama import AsrLlavaForCausalLM
 from peft import LoraConfig, get_peft_model
-
+from ..debug_utils import ddp_breakpoint
+from peft.tuners.lora.layer import LoraLayer
+import math
 
 def memory_refresh(memory, prev_exist):
     memory_shape = memory.shape
@@ -162,6 +165,72 @@ class SELayer_Linear(nn.Module):
         return x * self.gate(x_se)
         
 
+class ViewManipulator:
+    def __init__(self, num_view, num_spin, init_angle=0):
+        self.num_view = num_view
+        self.num_spin = num_spin
+        self.init_angle = math.radians(init_angle)
+        self.aug_angle = 0
+        self.fov = 2*math.pi / self.num_view
+        self.state_angle = self.fov / self.num_spin
+        
+    
+    def angle_aug(self):
+        self.aug_angle = torch.rand(1).item() * self.fov
+
+    def _cut_by_angle(self, coordinates, state):
+        angles = torch.atan2(coordinates[:, :, 1], coordinates[:, :, 0])
+        rotation_angle = self.init_angle + self.aug_angle + self.state_angle * state
+        angles = torch.fmod(angles + rotation_angle, 2 * math.pi)
+        groups = torch.floor(angles / self.fov).long() % self.num_view
+        return groups
+
+    def cut_batch_view(self, coordinates, state, restore=False):
+        '''
+        points : (B, N, 3)
+        n : int
+        '''
+        B = coordinates.shape[0]
+        groups = self._cut_by_angle(coordinates, state)
+        lens = []
+        indices = []
+        for b in range(B):
+            for v in range(self.num_view):
+                index = torch.nonzero(groups[b] == v, as_tuple=False).flatten()
+                indices.append(index)
+                lens.append(index.size(0))
+            
+        if not restore:
+            return indices, lens
+
+        restore_indices = []
+        for b in range(B):
+            batch_index = torch.cat(indices[b*self.num_view:(b+1)*self.num_view])
+            restore_indices.append(torch.argsort(batch_index))
+        return indices, lens, restore_indices
+
+    def transform_to_view(self, coords, view_idx, state, inverse=False, trans=True, dim=3):
+        rotation_angle = self.init_angle + self.aug_angle + self.state_angle * state
+        angle = self.fov*(2*view_idx+1) - 2*rotation_angle
+        angle = (math.pi - angle)/2
+        if not inverse:
+            angle = -angle
+        if dim == 3:
+            R = torch.tensor([[math.cos(angle), -math.sin(angle), 0],
+                            [math.sin(angle), math.cos(angle), 0],
+                            [0, 0, 1]]).to(coords.device)
+        elif dim == 2:
+            R = torch.tensor([[math.cos(angle), -math.sin(angle)],
+                            [math.sin(angle), math.cos(angle)]]).to(coords.device)
+        elif dim == 1:
+            R = torch.tensor([[math.cos(angle), math.sin(angle)],
+                            [-math.sin(angle), math.cos(angle)]]).to(coords.device)
+        if trans:
+            return (coords-0.5)@R + 0.5
+        else:
+            return coords@R
+        
+        
 class MLN(nn.Module):
     ''' 
     Args:
@@ -230,14 +299,35 @@ def transform_reference_points_lane(reference_points, egopose, reverse=False, tr
     return reference_points
 
 def load_model(base_model, use_lora, frozen):
+    # import torch.distributed as dist
+    # dist.barrier()
+    # rank = dist.get_rank()
+    # if rank == 0:
+    #         import pdb; pdb.set_trace()
+    # dist.barrier()
     model = LlavaLlamaForCausalLM.from_pretrained(base_model, torch_dtype=torch.float16, device_map='cpu')
-    model.gradient_checkpointing_enable()
+
     
     if frozen:
         model.eval()
         for p in model.parameters():
             p.requires_grad = False
-            
+        
+    # target_modules = []
+    # for name, module in model.named_modules():
+    #     if any(x in name for x in ("q_proj", "k_proj", "v_proj", "o_proj")) \
+    #     and "audio_tower" not in name:
+    #         target_modules.append(name.split('.')[-1])  # 这里要按你模型结构稍微处理下
+    # import torch.distributed as dist
+    # dist.barrier()
+    # rank = dist.get_rank()
+    # if rank == 0:
+    #         import pdb; pdb.set_trace()
+    # dist.barrier()
+    model.gradient_checkpointing_enable()
+
+    
+    
     if use_lora:
         peft_config = LoraConfig(
                 r=128,
@@ -246,7 +336,28 @@ def load_model(base_model, use_lora, frozen):
                 lora_dropout=0.05,
                 bias="none",
                 task_type="CAUSAL_LM")
+
         model = get_peft_model(model, peft_config)
+
+        # for name, module in model.named_modules():
+        #     if "audio_tower" in name and hasattr(module, "lora_A"):
+        #         module.lora_A.default.weight.data.zero_()
+        #         module.lora_B.default.weight.data.zero_()
+        #         module.scaling = 0.0
+        #         # 可选：也别训练它
+        #         for p in module.parameters():
+        #             p.requires_grad = False
+        
+        ADAPTER_NAME = "default"
+        for name, module in model.named_modules():
+            if "audio_tower" in name and isinstance(module, LoraLayer):
+                # 不让这条 LoRA 输出任何东西
+                if ADAPTER_NAME in module.scaling:
+                    module.scaling[ADAPTER_NAME] = 0.0
+
+                # 也别训练
+                for p in module.parameters():
+                    p.requires_grad = False
 
         for param in filter(lambda p: p.requires_grad,model.parameters()):
             param.data = param.data.to(torch.float32)
