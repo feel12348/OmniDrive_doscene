@@ -54,7 +54,8 @@ class LlavaMetaForCausalLM(ABC):
         return self.get_model().get_vision_tower()
 
     def prepare_inputs_labels_for_multimodal(
-        self, input_ids, position_ids, attention_mask, past_key_values, labels, image_features, image_sizes
+        self, input_ids, position_ids, attention_mask, past_key_values, labels,
+        image_features, image_sizes, number_values=None
     ):
         
         if  image_features is None or input_ids.shape[1] == 1:
@@ -116,7 +117,19 @@ class LlavaMetaForCausalLM(ABC):
                 cur_input_ids_noim.append(cur_input_ids[image_token_indices[i]+1:image_token_indices[i+1]])
                 cur_labels_noim.append(cur_labels[image_token_indices[i]+1:image_token_indices[i+1]])
             split_sizes = [x.shape[0] for x in cur_labels_noim]
-            cur_input_embeds = self.get_model().embed_tokens(torch.cat(cur_input_ids_noim))
+            cur_input_ids_noim_cat = torch.cat(cur_input_ids_noim)
+            cur_input_embeds = self.get_model().embed_tokens(cur_input_ids_noim_cat)
+            number_token_id = getattr(self.config, 'number_token_id', None)
+            if number_values is not None and number_token_id is not None and hasattr(self, 'number_projector'):
+                number_positions = torch.where(cur_input_ids_noim_cat == number_token_id)[0]
+                if number_positions.numel() > 0:
+                    cur_number_values = number_values[batch_idx].to(cur_input_embeds.device)
+                    cur_number_values = cur_number_values[~torch.isnan(cur_number_values)]
+                    num_to_use = min(number_positions.numel(), cur_number_values.numel())
+                    if num_to_use > 0:
+                        projected_numbers = self.number_projector(
+                            cur_number_values[:num_to_use].to(cur_input_embeds.dtype).unsqueeze(-1))
+                        cur_input_embeds[number_positions[:num_to_use]] = projected_numbers
             cur_input_embeds_no_im = torch.split(cur_input_embeds, split_sizes, dim=0)
             
             cur_new_input_embeds = []

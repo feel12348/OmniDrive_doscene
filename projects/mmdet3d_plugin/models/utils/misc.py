@@ -298,7 +298,7 @@ def transform_reference_points_lane(reference_points, egopose, reverse=False, tr
     reference_points = (matrix.unsqueeze(1).unsqueeze(1) @ reference_points.unsqueeze(-1)).squeeze(-1)[..., :3]
     return reference_points
 
-def load_model(base_model, use_lora, frozen):
+def load_model(base_model, use_lora, frozen, vocab_size=None, enable_drivecode_numbers=False):
     # import torch.distributed as dist
     # dist.barrier()
     # rank = dist.get_rank()
@@ -306,6 +306,8 @@ def load_model(base_model, use_lora, frozen):
     #         import pdb; pdb.set_trace()
     # dist.barrier()
     model = LlavaLlamaForCausalLM.from_pretrained(base_model, torch_dtype=torch.float16, device_map='cpu')
+    if vocab_size is not None and vocab_size > model.get_input_embeddings().num_embeddings:
+        model.resize_token_embeddings(vocab_size)
 
     
     if frozen:
@@ -361,5 +363,13 @@ def load_model(base_model, use_lora, frozen):
 
         for param in filter(lambda p: p.requires_grad,model.parameters()):
             param.data = param.data.to(torch.float32)
+
+    if enable_drivecode_numbers:
+        target_model = model.get_base_model() if hasattr(model, 'get_base_model') else model
+        for module_name in ['number_projector', 'number_head']:
+            module = getattr(target_model, module_name, None)
+            if module is not None:
+                for param in module.parameters():
+                    param.requires_grad = True
                
     return model

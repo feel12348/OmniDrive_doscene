@@ -63,7 +63,7 @@ class PETRFormatBundle3D(DefaultFormatBundle):
                 continue
             results[key] = DC(to_tensor(results[key]), stack=False)
             
-        for key in ['input_ids', 'vlm_labels']:
+        for key in ['input_ids', 'vlm_labels', 'number_values']:
             if key not in results:
                 continue
             results[key] = DC(results[key], stack=False)

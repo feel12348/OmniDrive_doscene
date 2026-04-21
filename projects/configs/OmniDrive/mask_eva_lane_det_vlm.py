@@ -25,8 +25,10 @@ batch_size = 2
 num_iters_per_epoch = 28130 // (num_gpus * batch_size)
 num_epochs = 6
 llm_path = 'ckpts/pretrain_qformer/'
+enable_drivecode_numbers = False
 
 collect_keys=['lidar2img', 'intrinsics', 'extrinsics','timestamp', 'img_timestamp', 'ego_pose', 'ego_pose_inv', 'command', 'can_bus']
+drivecode_number_keys = ['number_values'] if enable_drivecode_numbers else []
 input_modality = dict(
     use_lidar=False,
     use_camera=True,
@@ -41,6 +43,7 @@ model = dict(
     use_lora=True,
     tokenizer=llm_path,
     lm_head=llm_path, # set to None if don't use llm head
+    enable_drivecode_numbers=enable_drivecode_numbers,
     img_backbone=dict(
         type='EVAViT',
         img_size=640, 
@@ -198,11 +201,12 @@ train_pipeline = [
          tokenizer=llm_path, 
          max_length=2048, 
          ignore_type=[],
-         lane_objs_info="./data/nuscenes/lane_obj_train.pkl"),
+         lane_objs_info="./data/nuscenes/lane_obj_train.pkl",
+         enable_drivecode_numbers=enable_drivecode_numbers),
     dict(type='NormalizeMultiviewImage', **img_norm_cfg),
     dict(type='PadMultiViewImage', size_divisor=32),
     dict(type='PETRFormatBundle3D', class_names=class_names, collect_keys=collect_keys + ['prev_exists']),
-    dict(type='Collect3D', keys=['lane_pts', 'input_ids', 'vlm_labels', 'gt_bboxes_3d', 'gt_labels_3d', 'img', 'gt_bboxes', 'gt_labels', 'centers2d', 'depths', 'prev_exists'] + collect_keys,
+    dict(type='Collect3D', keys=['lane_pts', 'input_ids', 'vlm_labels', 'gt_bboxes_3d', 'gt_labels_3d', 'img', 'gt_bboxes', 'gt_labels', 'centers2d', 'depths', 'prev_exists'] + collect_keys + drivecode_number_keys,
              meta_keys=('filename', 'ori_shape', 'img_shape', 'pad_shape', 'scale_factor', 'flip', 'box_mode_3d', 'box_type_3d', 'img_norm_cfg', 'scene_token', 'gt_bboxes_3d','gt_labels_3d'))
 ]
 test_pipeline = [

@@ -53,6 +53,17 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         self.model = LlavaLlamaModel(config)
         self.hidden_size = config.hidden_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.number_projector = nn.Sequential(
+            nn.Linear(1, config.hidden_size),
+            nn.GELU(),
+            nn.Linear(config.hidden_size, config.hidden_size),
+        )
+        self.number_head = nn.Sequential(
+            nn.Linear(config.hidden_size, config.hidden_size // 2),
+            nn.LayerNorm(config.hidden_size // 2),
+            nn.GELU(),
+            nn.Linear(config.hidden_size // 2, 1),
+        )
         self.pretraining_tp = config.pretraining_tp
 
         number_tokens = [
@@ -80,6 +91,46 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
     def get_model(self):
         return self.model
 
+    def _get_ce_weight(self, device):
+        if self.weighted_mask.numel() == self.config.vocab_size:
+            return self.weighted_mask.float().to(device)
+        weight = torch.ones(self.config.vocab_size, device=device)
+        num_copy = min(self.weighted_mask.numel(), self.config.vocab_size)
+        weight[:num_copy] = self.weighted_mask[:num_copy].float().to(device)
+        return weight
+
+    def _number_regression_loss(self, hidden_states, labels, number_values):
+        if not getattr(self.config, 'drivecode_enabled', False):
+            return None
+        number_token_id = getattr(self.config, 'number_token_id', None)
+        if number_token_id is None or number_values is None or labels is None:
+            return None
+
+        preds = []
+        targets = []
+        number_values = number_values.to(hidden_states.device)
+        for batch_idx in range(labels.shape[0]):
+            label_positions = torch.where(labels[batch_idx] == number_token_id)[0]
+            label_positions = label_positions[label_positions > 0]
+            cur_targets = number_values[batch_idx]
+            cur_targets = cur_targets[~torch.isnan(cur_targets)]
+            num_to_use = min(label_positions.numel(), cur_targets.numel())
+            if num_to_use == 0:
+                continue
+            cur_hidden = hidden_states[batch_idx, label_positions[:num_to_use] - 1]
+            preds.append(self.number_head(cur_hidden).squeeze(-1))
+            targets.append(cur_targets[:num_to_use].to(hidden_states.dtype))
+        if len(preds) == 0:
+            return None
+
+        pred_values = torch.cat(preds)
+        target_values = torch.cat(targets)
+        if pred_values.numel() >= 2 and pred_values.numel() % 2 == 0:
+            pred_points = pred_values.view(-1, 2)
+            target_points = target_values.view(-1, 2)
+            return torch.norm(pred_points - target_points, dim=-1).mean()
+        return F.l1_loss(pred_values, target_values)
+
     def forward(
         self,
         input_ids: torch.LongTensor = None,
@@ -93,6 +144,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         output_hidden_states: Optional[bool] = None,
         images: Optional[torch.FloatTensor] = None,
         image_sizes: Optional[List[List[int]]] = None,
+        number_values: Optional[torch.FloatTensor] = None,
         return_dict: Optional[bool] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
 
@@ -111,7 +163,8 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                 past_key_values,
                 labels,
                 images,
-                image_sizes
+                image_sizes,
+                number_values=number_values
             )
 
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
@@ -148,12 +201,15 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
             # Flatten the tokens
-            loss_fct = CrossEntropyLoss(weight=self.weighted_mask.float())
+            loss_fct = CrossEntropyLoss(weight=self._get_ce_weight(shift_logits.device))
             shift_logits = shift_logits.view(-1, self.config.vocab_size)
             shift_labels = shift_labels.view(-1)
             # Enable model parallelism
             shift_labels = shift_labels.to(shift_logits.device)
             loss = loss_fct(shift_logits, shift_labels)
+            number_loss = self._number_regression_loss(hidden_states, labels, number_values)
+            if number_loss is not None:
+                loss = loss + number_loss.to(loss.dtype)
             loss = torch.nan_to_num(loss)
 
         if not return_dict:

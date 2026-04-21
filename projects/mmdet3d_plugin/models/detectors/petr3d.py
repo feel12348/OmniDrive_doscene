@@ -23,7 +23,7 @@ from mmdet3d.core import bbox3d2result
 from mmdet3d.models.detectors.mvx_two_stage import MVXTwoStageDetector
 from projects.mmdet3d_plugin.models.utils.grid_mask import GridMask
 from projects.mmdet3d_plugin.models.utils.misc import locations
-from ...datasets.utils.constants import IGNORE_INDEX
+from ...datasets.utils.constants import IGNORE_INDEX, DEFAULT_NUMBER_TOKEN
 from mmdet3d.models import builder
 from ..dense_heads.llava_llama import LlavaLlamaForCausalLM
 from transformers import AutoTokenizer, GenerationConfig
@@ -69,7 +69,8 @@ class Petr3D(MVXTwoStageDetector):
                  frozen=True,
                  use_lora=False,
                  pretrained=None,
-                 export_onnx=False):
+                 export_onnx=False,
+                 enable_drivecode_numbers=False):
         super(Petr3D, self).__init__(pts_voxel_layer, pts_voxel_encoder,
                              pts_middle_encoder, pts_fusion_layer,
                              img_backbone, pts_backbone, img_neck, pts_neck,
@@ -104,12 +105,19 @@ class Petr3D(MVXTwoStageDetector):
             self.map_head.time_embedding = self.time_embedding
             self.map_head.ego_pose_pe = self.ego_pose_pe
 
+        self.enable_drivecode_numbers = enable_drivecode_numbers
+        self.number_token_id = None
         if tokenizer is not None:
             self.tokenizer =  AutoTokenizer.from_pretrained(tokenizer,
                                         model_max_length=2048,
                                         padding_side="right",
                                         use_fast=False,
                                         )
+            if self.enable_drivecode_numbers:
+                self.tokenizer.add_special_tokens(
+                    {'additional_special_tokens': [DEFAULT_NUMBER_TOKEN]})
+                self.number_token_id = self.tokenizer.convert_tokens_to_ids(
+                    DEFAULT_NUMBER_TOKEN)
             self.tokenizer.pad_token = self.tokenizer.unk_token
         else:
             self.tokenizer = None
@@ -136,7 +144,16 @@ class Petr3D(MVXTwoStageDetector):
             )
         
         if lm_head is not None:
-            self.lm_head = load_model(lm_head, use_lora, frozen)
+            vocab_size = len(self.tokenizer) if self.tokenizer is not None else None
+            self.lm_head = load_model(
+                lm_head,
+                use_lora,
+                frozen,
+                vocab_size=vocab_size,
+                enable_drivecode_numbers=self.enable_drivecode_numbers)
+            lm_config_owner = self.lm_head.get_base_model() if hasattr(self.lm_head, 'get_base_model') else self.lm_head
+            lm_config_owner.config.drivecode_enabled = self.enable_drivecode_numbers
+            lm_config_owner.config.number_token_id = self.number_token_id
 
         self.test_flag = False
 
@@ -260,6 +277,7 @@ class Petr3D(MVXTwoStageDetector):
                           vlm_labels, 
                           vlm_attn_mask,
                           lane_pts,
+                          number_values=None,
                           **data):
         """Forward function for point cloud branch.
         Args:
@@ -298,7 +316,13 @@ class Petr3D(MVXTwoStageDetector):
             
         if self.with_lm_head:
             vision_embeded = torch.cat([vision_embeded_obj, vision_embeded_map], dim=1)
-            vlm_loss = self.lm_head(input_ids=input_ids, attention_mask=vlm_attn_mask, labels=vlm_labels, images=vision_embeded, use_cache=False)
+            vlm_loss = self.lm_head(
+                input_ids=input_ids,
+                attention_mask=vlm_attn_mask,
+                labels=vlm_labels,
+                images=vision_embeded,
+                number_values=number_values,
+                use_cache=False)
             losses.update(vlm_loss=vlm_loss[0])
             
         if self.with_img_roi_head:
@@ -335,6 +359,7 @@ class Petr3D(MVXTwoStageDetector):
                       centers2d=None,
                       input_ids=None,
                       vlm_labels=None,
+                      number_values=None,
                       lane_pts=None,
                       **data):
         """Forward training function.
@@ -376,17 +401,24 @@ class Petr3D(MVXTwoStageDetector):
             input_ids = input_ids[:, :self.tokenizer.model_max_length]
             vlm_labels = vlm_labels[:, :self.tokenizer.model_max_length]
             vlm_attn_mask = input_ids.ne(self.tokenizer.pad_token_id)
+            if number_values is not None:
+                number_values = torch.nn.utils.rnn.pad_sequence(
+                    number_values,
+                    batch_first=True,
+                    padding_value=float('nan'))
         else:
             input_ids = None
             vlm_labels = None
             vlm_attn_mask = None
+            number_values = None
 
         data['img_feats'] = self.extract_feat(data['img'])
 
         losses = self.forward_pts_train(gt_bboxes_3d,
                                     gt_labels_3d, gt_bboxes,
                                     gt_labels, img_metas, centers2d, 
-                                    depths, input_ids, vlm_labels, vlm_attn_mask, lane_pts, **data)
+                                    depths, input_ids, vlm_labels, vlm_attn_mask,
+                                    lane_pts, number_values=number_values, **data)
 
         return losses
   

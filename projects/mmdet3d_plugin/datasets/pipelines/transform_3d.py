@@ -28,7 +28,7 @@ from typing import List, Tuple, Union
 from shapely.geometry import MultiPoint, Polygon, LineString, Point
 from shapely.geometry import box as canvas_box
 from ..utils.data_utils import preprocess
-from ..utils.constants import DEFAULT_IMAGE_TOKEN
+from ..utils.constants import DEFAULT_IMAGE_TOKEN, DEFAULT_NUMBER_TOKEN
 import math
 import pickle
 
@@ -415,12 +415,17 @@ class LoadAnnoatationVQA():
             max_length, 
             n_gen=2, 
             ignore_type=["v1", "v2", "v3"],
-            lane_objs_info=None):
+            lane_objs_info=None,
+            enable_drivecode_numbers=False):
         self.tokenizer =  AutoTokenizer.from_pretrained(tokenizer,
                                             model_max_length=max_length,
                                             padding_side="right",
                                             use_fast=False,
                                             )
+        self.enable_drivecode_numbers = enable_drivecode_numbers
+        if self.enable_drivecode_numbers:
+            self.tokenizer.add_special_tokens(
+                {'additional_special_tokens': [DEFAULT_NUMBER_TOKEN]})
         self.n_gen = n_gen
         self.ignore_type = ignore_type
         self.tokenizer.pad_token = self.tokenizer.unk_token
@@ -677,12 +682,19 @@ class LoadAnnoatationVQA():
 
     def __call__(self, results):
         traj = None
+        number_values = None
         if 'gt_planning' in results.keys():
             planning_traj = results['gt_planning'][0 ,: , :2]
             mask = results['gt_planning_mask'][0].any(axis=1)
             planning_traj = planning_traj[mask]
             if len(planning_traj) == 6:
-                formatted_points = ', '.join(f"({format_number(point[0], 2)}, {format_number(point[1], 2)})" for point in planning_traj)
+                if self.enable_drivecode_numbers:
+                    formatted_points = ', '.join(
+                        f"({DEFAULT_NUMBER_TOKEN}, {DEFAULT_NUMBER_TOKEN})"
+                        for _ in planning_traj)
+                    number_values = planning_traj.reshape(-1).astype(np.float32)
+                else:
+                    formatted_points = ', '.join(f"({format_number(point[0], 2)}, {format_number(point[1], 2)})" for point in planning_traj)
                 traj = f"Here is the planning trajectory [PT, {formatted_points}]."
 
         sources = self.preprocess_vqa(results, traj)
@@ -716,6 +728,10 @@ class LoadAnnoatationVQA():
 
         results['input_ids'] = input_ids
         results['vlm_labels'] = vlm_labels
+        if number_values is not None:
+            results['number_values'] = torch.from_numpy(number_values)
+        elif self.enable_drivecode_numbers:
+            results['number_values'] = torch.empty(0, dtype=torch.float32)
         
         return results
 
